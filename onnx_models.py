@@ -1,8 +1,92 @@
+import logging
+import platform
 from abc import ABC
 
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+logger = logging.getLogger(__name__)
+
+
+def get_execution_providers(cpu_only: bool = False) -> tuple[list[str], list[dict]]:
+    """
+    Dynamically select ONNX Runtime execution providers based on the current
+    host platform and what is available in the installed ORT build.
+
+    Priority order:
+      - Apple Silicon (macOS arm64) : CoreMLExecutionProvider → CPU
+      - NVIDIA GPU (CUDA available)  : CUDAExecutionProvider  → CPU
+      - DirectML (Windows/AMD/Intel) : DmlExecutionProvider   → CPU
+      - Fallback                     : CPUExecutionProvider
+
+    Parameters
+    ----------
+    cpu_only : bool
+        When True, skip all accelerated EPs and use CPUExecutionProvider only.
+        Use this for models whose graphs contain ops (e.g. NonMaxSuppression)
+        that produce zero-element tensors at runtime — a case that CoreML EP
+        does not support.
+
+    Returns
+    -------
+    providers : list[str]
+        Ordered list of provider names accepted by ``ort.InferenceSession``.
+    provider_options : list[dict]
+        Matching list of per-provider option dicts (empty dict where unused).
+    """
+    available = ort.get_available_providers()
+    logger.info("Detected ONNX Runtime providers: %s", available)
+
+    providers: list[str] = []
+    provider_options: list[dict] = []
+
+    if cpu_only:
+        logger.info("cpu_only=True: skipping accelerated EPs, using CPUExecutionProvider.")
+        return ["CPUExecutionProvider"], [{}]
+
+    # --- Apple Silicon (macOS arm64) ---
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        if "CoreMLExecutionProvider" in available:
+            providers.append("CoreMLExecutionProvider")
+            # Empty options → CoreML defaults (All compute units: ANE + GPU + CPU).
+            # Unsupported ops automatically delegate to CPUExecutionProvider.
+            provider_options.append({})
+            logger.info("Using CoreMLExecutionProvider for inference.")
+        else:
+            logger.warning(
+                "CoreMLExecutionProvider not found; falling back to CPU. "
+                "Consider upgrading to onnxruntime >= 1.16.0."
+            )
+
+    # --- NVIDIA CUDA ---
+    elif "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+        provider_options.append(
+            {
+                "device_id": 0,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
+                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                "do_copy_in_default_stream": True,
+            }
+        )
+        logger.info("Using CUDAExecutionProvider for inference.")
+
+    # --- DirectML (Windows, AMD/Intel GPU) ---
+    elif "DmlExecutionProvider" in available:
+        providers.append("DmlExecutionProvider")
+        provider_options.append({"device_id": 0})
+        logger.info("Using DmlExecutionProvider for inference.")
+
+    # --- CPU fallback (always appended last) ---
+    providers.append("CPUExecutionProvider")
+    provider_options.append({})
+
+    if len(providers) == 1:
+        logger.info("Using CPUExecutionProvider for inference.")
+
+    return providers, provider_options
 
 
 class OnnxModel(ABC):
@@ -11,10 +95,11 @@ class OnnxModel(ABC):
         self.image_size = image_size
         self.mean = np.array([127, 127, 127], dtype=np.float32)
         self.std = np.array([128, 128, 128], dtype=np.float32)
-        options, prov_opts, providers = self.get_onnx_provider()
+        options, providers, prov_opts = self._build_session_options(cpu_only=getattr(self, "_cpu_only", False))
         self.sess = ort.InferenceSession(
             model_path, sess_options=options, providers=providers, provider_options=prov_opts
         )
+        logger.info("Session loaded with providers: %s", self.sess.get_providers())
         self._get_input_output()
 
     def preprocess(self, frame):
@@ -54,42 +139,26 @@ class OnnxModel(ABC):
         )
 
     @staticmethod
-    def get_onnx_provider():
+    def _build_session_options(cpu_only: bool = False) -> tuple:
         """
-        Get onnx provider
+        Build ``ort.SessionOptions`` and resolve execution providers.
+
+        Parameters
+        ----------
+        cpu_only : bool
+            Passed through to ``get_execution_providers``.
+
         Returns
         -------
-        options : onnxruntime.SessionOptions
-            Session options
-        prov_opts : dict
-            Provider options
-        providers : list
-            List of providers
+        options : ort.SessionOptions
+        providers : list[str]
+        provider_options : list[dict]
         """
-        providers = ["CPUExecutionProvider"]
         options = ort.SessionOptions()
         options.enable_mem_pattern = False
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        prov_opts = []
-        print("Using ONNX Runtime", ort.get_device())
-
-        if "DML" in ort.get_device():
-            prov_opts = [{"device_id": 0}]
-            providers.append("DmlExecutionProvider")
-
-        elif "GPU" in ort.get_device():
-            prov_opts = [
-                {
-                    "device_id": 0,
-                    "arena_extend_strategy": "kNextPowerOfTwo",
-                    "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
-                    "cudnn_conv_algo_search": "EXHAUSTIVE",
-                    "do_copy_in_default_stream": True,
-                }
-            ]
-            providers.append("CUDAExecutionProvider")
-
-        return options, prov_opts, providers
+        providers, provider_options = get_execution_providers(cpu_only=cpu_only)
+        return options, providers, provider_options
 
     def __repr__(self):
         return (
@@ -101,10 +170,14 @@ class OnnxModel(ABC):
         )
 
 class HandDetection(OnnxModel):
+    # The hand detector uses NonMaxSuppression, whose output becomes a
+    # zero-element tensor when no hands are present.  CoreML EP cannot
+    # process zero-element tensors, so we force CPU-only for this model.
+    _cpu_only = True
+
     def __init__(self, model_path, image_size=(320, 240)):
         super().__init__(model_path, image_size)
-        self.image_size = image_size
-        self.sess = ort.InferenceSession(model_path)
+        # Reuse self.sess created by OnnxModel.__init__ (provider-aware).
         self.input_name = self.sess.get_inputs()[0].name
         self.output_names = [output.name for output in self.sess.get_outputs()]
         
