@@ -1,4 +1,5 @@
 import argparse
+import logging
 import time
 
 import cv2
@@ -6,6 +7,11 @@ import numpy as np
 
 from main_controller import MainController
 from utils import Drawer, Event, targets
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 
 def run(args):
