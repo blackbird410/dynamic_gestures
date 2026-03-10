@@ -116,10 +116,14 @@ class OnnxModel(ABC):
         """
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, self.image_size)
-        image = (image - self.mean) / self.std
+        # Explicit float32 cast is required: numpy's type-promotion rules
+        # for uint8 − float32 vary across numpy versions (1.x vs 2.x).
+        # Without the cast the result may be float64, which ONNX Runtime
+        # rejects silently on some backends, producing 0 detections.
+        image = ((image.astype(np.float32) - self.mean) / self.std)
         image = np.transpose(image, [2, 0, 1])
         image = np.expand_dims(image, axis=0)
-        return image
+        return image  # shape (1, 3, H, W), dtype float32
 
     def _get_input_output(self):
         inputs = self.sess.get_inputs()
