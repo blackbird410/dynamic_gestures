@@ -104,22 +104,32 @@ class OnnxModel(ABC):
 
     def preprocess(self, frame):
         """
-        Preprocess frame
+        Preprocess frame for inference.
+
+        Converts BGR → RGB, resizes to ``self.image_size``, applies
+        ``(pixel - 127) / 128`` normalisation and returns an NCHW float32
+        tensor ready for ONNX Runtime.
+
         Parameters
         ----------
         frame : np.ndarray
-            Frame to preprocess
+            BGR uint8 frame as returned by ``cv2.VideoCapture.read``.
+
         Returns
         -------
         np.ndarray
-            Preprocessed frame
+            Float32 NCHW tensor, shape ``(1, 3, H, W)``.
         """
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, self.image_size)
-        image = (image - self.mean) / self.std
+        # Explicit float32 cast is required: numpy's type-promotion rules
+        # for uint8 − float32 vary across numpy versions (1.x vs 2.x).
+        # Without the cast the result may be float64, which ONNX Runtime
+        # rejects silently on some backends, producing 0 detections.
+        image = ((image.astype(np.float32) - self.mean) / self.std)
         image = np.transpose(image, [2, 0, 1])
         image = np.expand_dims(image, axis=0)
-        return image
+        return image  # shape (1, 3, H, W), dtype float32
 
     def _get_input_output(self):
         inputs = self.sess.get_inputs()
@@ -170,26 +180,122 @@ class OnnxModel(ABC):
         )
 
 class HandDetection(OnnxModel):
+    """
+    Real-time hand detector built on a single-class SSD model with
+    in-graph NonMaxSuppression.
+
+    Design notes
+    ------------
+    * ``_cpu_only = True`` — the built-in NMS op returns a *zero-element*
+      tensor when no hands are present.  CoreML EP cannot handle zero-element
+      intermediate tensors so this model must run on CPU only.
+    * ``score_threshold`` — applied to the raw model scores **after** the
+      in-graph NMS.  Only boxes whose confidence ≥ threshold are forwarded to
+      the tracker, preventing false-positive noise from being tracked.
+    """
+
     # The hand detector uses NonMaxSuppression, whose output becomes a
     # zero-element tensor when no hands are present.  CoreML EP cannot
     # process zero-element tensors, so we force CPU-only for this model.
     _cpu_only = True
 
-    def __init__(self, model_path, image_size=(320, 240)):
+    # Minimum brightness (mean pixel value) below which a camera frame is
+    # considered under-exposed and is skipped.  Protects against the
+    # auto-exposure dark frames that appear when the camera first opens.
+    _MIN_FRAME_MEAN = 30.0
+
+    def __init__(self, model_path, image_size=(320, 240), score_threshold: float = 0.5):
+        """
+        Parameters
+        ----------
+        model_path : str
+            Path to ``hand_detector.onnx``.
+        image_size : tuple[int, int]
+            ``(width, height)`` fed to ``cv2.resize``.
+        score_threshold : float
+            Detections with confidence below this value are discarded.
+            Default 0.5 is consistent with the original model's training.
+        """
         super().__init__(model_path, image_size)
         # Reuse self.sess created by OnnxModel.__init__ (provider-aware).
         self.input_name = self.sess.get_inputs()[0].name
         self.output_names = [output.name for output in self.sess.get_outputs()]
-        
-    def __call__(self, frame):
+        self.score_threshold = score_threshold
+        logger.info(
+            "HandDetection ready | providers=%s image_size=%s score_threshold=%.2f",
+            self.sess.get_providers(), image_size, score_threshold,
+        )
+
+    def __call__(self, frame: np.ndarray):
+        """
+        Detect hands in *frame*.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            BGR uint8 frame, shape ``(H, W, 3)``.
+
+        Returns
+        -------
+        boxes : np.ndarray, shape (N, 4), dtype int32
+            Bounding boxes in pixel coordinates ``[x1, y1, x2, y2]``.
+        scores : np.ndarray, shape (N,), dtype float32
+            Per-detection confidence scores ≥ ``score_threshold``.
+        """
+        # --- Frame sanity check -----------------------------------------
+        # Camera frames captured immediately after VideoCapture.open() are
+        # often near-black (pixel mean < 30) while the sensor is doing its
+        # initial auto-exposure.  The model produces 0 detections on such
+        # frames, which looks like a pipeline bug but is actually correct.
+        # We log a debug warning so operators can tell the two situations
+        # apart without adding extra logic in the main loop.
+        frame_mean = float(frame.mean())
+        if frame_mean < self._MIN_FRAME_MEAN:
+            logger.debug(
+                "Under-exposed frame (mean=%.1f < %.1f): skipping inference "
+                "— allow camera ~1 s to auto-expose.",
+                frame_mean, self._MIN_FRAME_MEAN,
+            )
+            return np.empty((0, 4), dtype=np.int32), np.empty((0,), dtype=np.float32)
+
+        # --- Inference --------------------------------------------------
         input_tensor = self.preprocess(frame)
-        boxes, _, probs = self.sess.run(self.output_names, {self.input_name: input_tensor})
-        width, height = frame.shape[1], frame.shape[0]
-        boxes[:, 0] *= width
-        boxes[:, 1] *= height
-        boxes[:, 2] *= width
-        boxes[:, 3] *= height
-        return boxes.astype(np.int32), probs
+        boxes, _, scores = self.sess.run(
+            self.output_names, {self.input_name: input_tensor}
+        )
+
+        logger.debug(
+            "raw detections=%d  score_range=[%.3f, %.3f]",
+            boxes.shape[0],
+            float(scores.min()) if scores.size > 0 else float("nan"),
+            float(scores.max()) if scores.size > 0 else float("nan"),
+        )
+
+        # --- Confidence filtering ---------------------------------------
+        # The model's in-graph NMS already applies its own threshold, but
+        # a secondary filter here lets callers tune the operating point
+        # without re-exporting the ONNX model.
+        if scores.size > 0:
+            keep = scores >= self.score_threshold
+            boxes  = boxes[keep]
+            scores = scores[keep]
+
+        logger.debug(
+            "after score_threshold=%.2f: %d detections kept",
+            self.score_threshold, boxes.shape[0],
+        )
+
+        # --- Coordinate de-normalisation --------------------------------
+        # Model outputs are normalised to [0, 1]; scale back to pixels.
+        height, width = frame.shape[:2]
+        if boxes.shape[0] > 0:
+            boxes = boxes.copy().astype(np.float32)
+            boxes[:, 0] *= width
+            boxes[:, 1] *= height
+            boxes[:, 2] *= width
+            boxes[:, 3] *= height
+
+        return boxes.astype(np.int32), scores
 
 
 class HandClassification(OnnxModel):

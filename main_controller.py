@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 
 from ocsort import (
@@ -14,6 +16,8 @@ from onnx_models import HandClassification, HandDetection
 from utils import Deque, Drawer, Hand
 
 ASSO_FUNCS = {"iou": iou_batch, "giou": giou_batch, "ciou": ciou_batch, "diou": diou_batch, "ct_dist": ct_dist}
+
+logger = logging.getLogger(__name__)
 
 
 def k_previous_obs(observations, cur_age, k):
@@ -213,10 +217,16 @@ class MainController:
 
         """
         bboxes, probs = self.detection_model(frame)
+        logger.debug(
+            "detector: %d raw detections (frame_count=%d, active_tracks=%d)",
+            len(bboxes), self.frame_count, len(self.tracks),
+        )
         if len(bboxes):
             labels = self.classification_model(frame, bboxes)
             bboxes = np.concatenate((bboxes, np.expand_dims(probs, axis=1)), axis=1)
             new_bboxes, labels = self.update(dets=bboxes, labels=labels)
+            n_confirmed = new_bboxes.shape[0] if new_bboxes.ndim > 1 else 0
+            logger.debug("tracker: %d confirmed tracks", n_confirmed)
             return new_bboxes[:, :-1], new_bboxes[:, -1], labels
         else:
             self.update(np.empty((0, 5)), None)
