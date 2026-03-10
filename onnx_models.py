@@ -104,15 +104,21 @@ class OnnxModel(ABC):
 
     def preprocess(self, frame):
         """
-        Preprocess frame
+        Preprocess frame for inference.
+
+        Converts BGR → RGB, resizes to ``self.image_size``, applies
+        ``(pixel - 127) / 128`` normalisation and returns an NCHW float32
+        tensor ready for ONNX Runtime.
+
         Parameters
         ----------
         frame : np.ndarray
-            Frame to preprocess
+            BGR uint8 frame as returned by ``cv2.VideoCapture.read``.
+
         Returns
         -------
         np.ndarray
-            Preprocessed frame
+            Float32 NCHW tensor, shape ``(1, 3, H, W)``.
         """
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, self.image_size)
@@ -174,6 +180,20 @@ class OnnxModel(ABC):
         )
 
 class HandDetection(OnnxModel):
+    """
+    Real-time hand detector built on a single-class SSD model with
+    in-graph NonMaxSuppression.
+
+    Design notes
+    ------------
+    * ``_cpu_only = True`` — the built-in NMS op returns a *zero-element*
+      tensor when no hands are present.  CoreML EP cannot handle zero-element
+      intermediate tensors so this model must run on CPU only.
+    * ``score_threshold`` — applied to the raw model scores **after** the
+      in-graph NMS.  Only boxes whose confidence ≥ threshold are forwarded to
+      the tracker, preventing false-positive noise from being tracked.
+    """
+
     # The hand detector uses NonMaxSuppression, whose output becomes a
     # zero-element tensor when no hands are present.  CoreML EP cannot
     # process zero-element tensors, so we force CPU-only for this model.
